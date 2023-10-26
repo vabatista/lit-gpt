@@ -1,8 +1,9 @@
 import sys
+import json
 import time
 from pathlib import Path
 from typing import Literal, Optional
-
+from tqdm import tqdm   
 import lightning as L
 import torch
 from lightning.fabric.plugins import BitsandbytesPrecision
@@ -28,19 +29,53 @@ lora_projection = False
 lora_mlp = False
 lora_head = False
 
+def load_data(input_file):
+    with open(input_file, 'r') as file:
+        json_list = list(file)
+    
+    data = []
+    # [1:] removes the header
+    for item in json_list[1:]:
+        item = json.loads(item)
+        data.append(item)
+
+    return data
+
+
+def get_contexts_questions_answers(json_data):
+    data_list = []
+
+    for paragraph in json_data:
+        context = paragraph['context']
+        for qa in paragraph['qas']:
+            question = qa['question']
+            if qa['detected_answers']:
+                answer = list(set([a['text'] for a in qa['detected_answers']]))
+            elif qa['answers']:
+                answer = list(qa['answers'])
+
+            data_dict = {
+                'context': context,
+                'question': question,
+                'answer': answer
+            }
+            data_list.append(data_dict)
+
+    return data_list
 
 def main(
     prompt: str = "What food do lamas eat?",
     input: str = "",
-    lora_path: Path = Path("out/lora/alpaca/lit_model_lora_finetuned.pth"),
+    lora_path: Path = Path("out/lora/squad/lit_model_lora_finetuned.pth"),
     checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8", "gptq.int4"]] = None,
     max_new_tokens: int = 100,
     top_k: int = 200,
-    temperature: float = 0.8,
+    temperature: float = 0.2,
     strategy: str = "auto",
     devices: int = 1,
     precision: Optional[str] = None,
+    input_squad_file: str = None,
 ) -> None:
     """Generates a response based on a given instruction and an optional input.
     This script will only work with checkpoints from the instruction-tuned GPT-LoRA model.
@@ -132,29 +167,51 @@ def main(
     tokenizer = Tokenizer(checkpoint_dir)
 
     ##
-
-    sample = {"instruction": prompt, "input": input}
-    prompt = generate_prompt(sample)
-    encoded = tokenizer.encode(prompt, device=fabric.device)
-    prompt_length = encoded.size(0)
-    max_returned_tokens = prompt_length + max_new_tokens
-
-    with fabric.init_tensor():
-        # set the max_seq_length to limit the memory usage to what we need
-        model.max_seq_length = max_returned_tokens
-        # enable the kv cache
-        model.set_kv_cache(batch_size=1)
-
+    data = load_data(input_squad_file)
+    triples = get_contexts_questions_answers(data)
+    
+    predictions_with_correct_context = []
+    references = []
     t0 = time.perf_counter()
-    y = generate(model, encoded, max_returned_tokens, temperature=temperature, top_k=top_k, eos_id=tokenizer.eos_id)
+    for idx, triple in enumerate(tqdm(triples)):
+        question, answers, context = triple['question'], triple['answer'], triple['context']
+        references.append({'id': str(idx), 'answers': {'answer_start': [context.find(answer) for answer in answers], 'text': [answer for answer in answers]}})
+
+        sample = {"instruction": question, "input": context}
+        prompt = generate_prompt(sample)
+        encoded = tokenizer.encode(prompt, device=fabric.device)
+        prompt_length = encoded.size(0)
+        max_returned_tokens = prompt_length + max_new_tokens
+
+        with fabric.init_tensor():
+            # set the max_seq_length to limit the memory usage to what we need
+            model.max_seq_length = max_returned_tokens
+            # enable the kv cache
+            model.set_kv_cache(batch_size=1)
+
+        
+        y = generate(model, encoded, max_returned_tokens, temperature=temperature, top_k=top_k, eos_id=tokenizer.eos_id)
+        
+
+        output = tokenizer.decode(y)
+        output = output.split("### Response:")[1].strip()
+        predictions_with_correct_context.append({'id': str(idx), 'prediction_text':  output})
+    
     t = time.perf_counter() - t0
+    fabric.print(f"\n\nTime for inference: {t:.02f} sec total", file=sys.stderr)
 
-    output = tokenizer.decode(y)
-    output = output.split("### Response:")[1].strip()
-    fabric.print(output)
+    ## Save both predictions and references to files for evaluation
+    predictions_with_correct_context_file = '/home/users/vabatista/lit-gpt/out/squad/predictions_with_correct_context.json'
+    references_file = '/home/users/vabatista/lit-gpt/out/squad/references.json'
+    
+    with open(predictions_with_correct_context_file, 'w') as f:
+        json.dump(predictions_with_correct_context, f)
 
-    tokens_generated = y.size(0) - prompt_length
-    fabric.print(f"\n\nTime for inference: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr)
+    with open(references_file, 'w') as f:
+        json.dump(references, f)
+
+
+    
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB", file=sys.stderr)
 

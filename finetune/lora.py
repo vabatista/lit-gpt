@@ -36,13 +36,13 @@ log_interval = 1
 devices = 1
 
 # Hyperparameters
-learning_rate = 3e-4
+learning_rate = 1e-4 #e-4
 batch_size = 128
 micro_batch_size = 4
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 50000  # train dataset size
-weight_decay = 0.01
+max_iters = 2500 #50000  # train dataset size
+weight_decay = 1e-3 #0.01
 lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.05
@@ -52,7 +52,7 @@ lora_value = True
 lora_projection = False
 lora_mlp = False
 lora_head = False
-warmup_steps = 100
+warmup_steps = 200 #100
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 
