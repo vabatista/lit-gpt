@@ -130,16 +130,16 @@ def generate_prompt(example: dict) -> str:
     """Generates a standardized message to prompt the model with an instruction, optional input and a
     'response' field."""
 
-    if example["input"]:
+    if example["input"]:        
         return (
-            "Below is an instruction that describes a task, paired with an input that provides further context. "
-            "Write a response that appropriately completes the request.\n\n"
-            f"### Instruction:\n{example['instruction']}\n\n### Input:\n{example['input']}\n\n### Response:"
+            "Below is an instruction that describes a extractive question answering task (like SQuAD). There is a question and a context. "
+            "Write a response that answers the Question in most short and objective way. This answer should be a span from the context below.\n\n"
+            f"### Question:\n{example['instruction']}\n\n### Context:\n{example['input']}\n\n### Response:"
         )
     return (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        f"### Instruction:\n{example['instruction']}\n\n### Response:"
+        "Below is an instruction that describes a extractive question answering task (like SQuAD). There is a question and a context. "
+        "Write a response that answers the Question in most short and objective way. This answer should be a span from the context below.\n\n"
+        f"### Question:\n{example['instruction']}\n\n### Response:"
     )
 
 
