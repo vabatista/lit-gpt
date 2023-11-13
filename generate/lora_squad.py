@@ -1,4 +1,5 @@
 import sys
+import os
 import json
 import time
 from pathlib import Path
@@ -8,6 +9,7 @@ import lightning as L
 import torch
 from lightning.fabric.plugins import BitsandbytesPrecision
 from lightning.fabric.strategies import FSDPStrategy
+from datasets import load_metric
 
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
@@ -23,11 +25,11 @@ lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.05
 lora_query = True
-lora_key = False
+lora_key = True
 lora_value = True
-lora_projection = False
-lora_mlp = False
-lora_head = False
+lora_projection = True
+lora_mlp = True
+lora_head = True
 
 def load_data(input_file):
     with open(input_file, 'r') as file:
@@ -76,6 +78,7 @@ def main(
     devices: int = 1,
     precision: Optional[str] = None,
     input_squad_file: str = None,
+    output_dir: Path = Path("out/preds/squad")
 ) -> None:
     """Generates a response based on a given instruction and an optional input.
     This script will only work with checkpoints from the instruction-tuned GPT-LoRA model.
@@ -182,27 +185,31 @@ def main(
         encoded = tokenizer.encode(prompt, device=fabric.device)
         prompt_length = encoded.size(0)
         max_returned_tokens = prompt_length + max_new_tokens
+        try: 
+            with fabric.init_tensor():
+                # set the max_seq_length to limit the memory usage to what we need
+                model.max_seq_length = max_returned_tokens
+                # enable the kv cache
+                model.set_kv_cache(batch_size=1)
 
-        with fabric.init_tensor():
-            # set the max_seq_length to limit the memory usage to what we need
-            model.max_seq_length = max_returned_tokens
-            # enable the kv cache
-            model.set_kv_cache(batch_size=1)
+            y = generate(model, encoded, max_returned_tokens, temperature=temperature, top_k=top_k, eos_id=tokenizer.eos_id)
+            
 
-        
-        y = generate(model, encoded, max_returned_tokens, temperature=temperature, top_k=top_k, eos_id=tokenizer.eos_id)
-        
-
-        output = tokenizer.decode(y)
-        output = output.split("### Response:")[1].strip()
+            output = tokenizer.decode(y)
+            output = output.split("### Response:")[1].strip()
+        except:
+            output = ''
         predictions_with_correct_context.append({'id': str(idx), 'prediction_text':  output})
     
     t = time.perf_counter() - t0
     fabric.print(f"\n\nTime for inference: {t:.02f} sec total", file=sys.stderr)
 
     ## Save both predictions and references to files for evaluation
-    predictions_with_correct_context_file = '/home/users/vabatista/lit-gpt/out/squad/predictions_with_correct_context.json'
-    references_file = '/home/users/vabatista/lit-gpt/out/squad/references.json'
+    ## if output_dir does not exist, create it
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    predictions_with_correct_context_file = os.path.join(output_dir,'predictions_with_correct_context.json')
+    references_file = os.path.join(output_dir, 'references.json')
     
     with open(predictions_with_correct_context_file, 'w') as f:
         json.dump(predictions_with_correct_context, f)
@@ -210,7 +217,11 @@ def main(
     with open(references_file, 'w') as f:
         json.dump(references, f)
 
-
+    squad_metric = load_metric('squad')
+    results = squad_metric.compute(predictions=predictions_with_correct_context, references=references)
+    print(results)
+    print(f"Exact match: {results['exact_match']:.2f}")
+    print(f"F1 score: {results['f1']:.2f}")
     
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB", file=sys.stderr)

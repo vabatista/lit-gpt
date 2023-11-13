@@ -40,7 +40,7 @@ def main(
     temperature: float = 0.8,
     strategy: str = "auto",
     devices: int = 1,
-    precision: Optional[str] = None,
+    precision: Optional[str] = None
 ) -> None:
     """Generates a response based on a given instruction and an optional input.
     This script will only work with checkpoints from the instruction-tuned GPT-LoRA model.
@@ -138,7 +138,7 @@ def main(
     encoded = tokenizer.encode(prompt, device=fabric.device)
     prompt_length = encoded.size(0)
     max_returned_tokens = prompt_length + max_new_tokens
-
+    
     with fabric.init_tensor():
         # set the max_seq_length to limit the memory usage to what we need
         model.max_seq_length = max_returned_tokens

@@ -3,6 +3,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
+from tqdm import tqdm
 
 import lightning as L
 import torch
@@ -28,31 +29,69 @@ from lit_gpt.utils import (
 )
 from scripts.prepare_alpaca import generate_prompt
 
-eval_interval = 100
-save_interval = 100
-eval_iters = 100
-eval_max_new_tokens = 100
-log_interval = 1
-devices = 1
+# eval_interval = 100
+# save_interval = 100
+# eval_iters = 100
+# eval_max_new_tokens = 100
+# log_interval = 1
+# devices = 1
 
-# Hyperparameters
-learning_rate = 1e-4 #e-4
-batch_size = 64
-micro_batch_size = 1
-gradient_accumulation_iters = batch_size // micro_batch_size
+# # Hyperparameters
+# learning_rate = 1e-3 #e-4
+# batch_size = 64
+# micro_batch_size = 4
+# gradient_accumulation_iters = batch_size // micro_batch_size
+# assert gradient_accumulation_iters > 0
+
+# weight_decay = 1e-2 #0.01
+# lora_r = 8
+# lora_alpha = 16
+# lora_dropout = 0.05
+# lora_query = True
+# lora_key = True
+# lora_value = True
+# lora_projection = True
+# lora_mlp = True
+# lora_head = True
+# max_iters = 10000 #50000  # train dataset size
+# warmup_steps = int(max_iters*.1) #1000 #100
+
+
+class LoraConfig:
+    def __init__(self, eval_interval=100, save_interval=100, eval_iters=100, eval_max_new_tokens=100,
+                 log_interval=1, devices=1, learning_rate=1e-3, batch_size=64, micro_batch_size=4,
+                 weight_decay=1e-2, lora_r=8, lora_alpha=16, lora_dropout=0.05, lora_query=True,
+                 lora_key=True, lora_value=True, lora_projection=True, lora_mlp=True, lora_head=True):
+        self.eval_interval = eval_interval
+        self.save_interval = save_interval
+        self.eval_iters = eval_iters
+        self.eval_max_new_tokens = eval_max_new_tokens
+        self.log_interval = log_interval
+        self.devices = devices
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.micro_batch_size = micro_batch_size
+        self.gradient_accumulation_iters = batch_size // micro_batch_size
+        self.weight_decay = weight_decay
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
+        self.lora_query = lora_query
+        self.lora_key = lora_key
+        self.lora_value = lora_value
+        self.lora_projection = lora_projection
+        self.lora_mlp = lora_mlp
+        self.lora_head = lora_head
+        self.max_iters = 1
+        self.warmup_steps = 1
+        self.epochs = 1
+
+config = LoraConfig(eval_interval=1000, save_interval=1000, eval_iters=1000, eval_max_new_tokens=100,
+                    log_interval=50, devices=1, learning_rate=5e-4, batch_size=64, micro_batch_size=4,
+                    weight_decay=0.01, lora_r=8, lora_alpha=16, lora_dropout=0.05, lora_query=True,
+                    lora_key=True, lora_value=True, lora_projection=True, lora_mlp=True, lora_head=True)
+gradient_accumulation_iters = config.batch_size // config.micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 10000 #50000  # train dataset size
-weight_decay = 1e-2 #0.01
-lora_r = 8
-lora_alpha = 16
-lora_dropout = 0.05
-lora_query = True
-lora_key = False
-lora_value = True
-lora_projection = False
-lora_mlp = False
-lora_head = False
-warmup_steps = int(max_iters*.1) #1000 #100
 
 hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
 
@@ -63,8 +102,10 @@ def setup(
     out_dir: Path = Path("out/lora/alpaca"),
     precision: Optional[str] = None,
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8-training"]] = None,
+    epochs: int = 1,
 ) -> None:
     precision = precision or get_default_supported_precision(training=True)
+    config.epochs = epochs
 
     plugins = None
     if quantize is not None and quantize.startswith("bnb."):
@@ -74,7 +115,7 @@ def setup(
         plugins = BitsandbytesPrecision(quantize[4:], dtype)
         precision = None
 
-    if devices > 1:
+    if config.devices > 1:
         if quantize:
             raise NotImplementedError(
                 "Quantization is currently not supported for multi-GPU training. Please set devices=1 when using the"
@@ -90,8 +131,8 @@ def setup(
     else:
         strategy = "auto"
 
-    logger = CSVLogger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=log_interval)
-    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=logger, plugins=plugins)
+    logger = CSVLogger(out_dir.parent, out_dir.name, flush_logs_every_n_steps=config.log_interval)
+    fabric = L.Fabric(devices=config.devices, strategy=strategy, precision=precision, loggers=logger, plugins=plugins)
     fabric.print(hparams)
     fabric.launch(main, data_dir, checkpoint_dir, out_dir)
 
@@ -109,24 +150,27 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) 
     train_data = torch.load(data_dir / "train.pt")
     val_data = torch.load(data_dir / "test.pt")
 
-    if not any((lora_query, lora_key, lora_value, lora_projection, lora_mlp, lora_head)):
+    config.max_iters = config.epochs * len(train_data) // config.batch_size #10000 #50000  # train dataset size
+    config.warmup_steps = int(config.max_iters*.1) #1000 #100
+
+    if not any((config.lora_query, config.lora_key, config.lora_value, config.lora_projection, config.lora_mlp, config.lora_head)):
         fabric.print("Warning: all LoRA layers are disabled!")
-    config = Config.from_name(
+    configLora = Config.from_name(
         name=checkpoint_dir.name,
-        r=lora_r,
-        alpha=lora_alpha,
-        dropout=lora_dropout,
-        to_query=lora_query,
-        to_key=lora_key,
-        to_value=lora_value,
-        to_projection=lora_projection,
-        to_mlp=lora_mlp,
-        to_head=lora_head,
+        r=config.lora_r,
+        alpha=config.lora_alpha,
+        dropout=config.lora_dropout,
+        to_query=config.lora_query,
+        to_key=config.lora_key,
+        to_value=config.lora_value,
+        to_projection=config.lora_projection,
+        to_mlp=config.lora_mlp,
+        to_head=config.lora_head,
     )
     checkpoint_path = checkpoint_dir / "lit_model.pth"
-    fabric.print(f"Loading model {str(checkpoint_path)!r} with {config.__dict__}")
-    with fabric.init_module(empty_init=(devices > 1)):
-        model = GPT(config)
+    fabric.print(f"Loading model {str(checkpoint_path)!r} with {configLora.__dict__}")
+    with fabric.init_module(empty_init=(config.devices > 1)):
+        model = GPT(configLora)
     mark_only_lora_as_trainable(model)
 
     fabric.print(f"Number of trainable parameters: {num_parameters(model, requires_grad=True):,}")
@@ -138,11 +182,11 @@ def main(fabric: L.Fabric, data_dir: Path, checkpoint_dir: Path, out_dir: Path) 
     if isinstance(fabric.strategy.precision, BitsandbytesPrecision):
         import bitsandbytes as bnb
 
-        optimizer = bnb.optim.PagedAdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+        optimizer = bnb.optim.PagedAdamW(trainable_params, lr=config.learning_rate, weight_decay=config.weight_decay)
     else:
-        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate, weight_decay=config.weight_decay)
     optimizer = fabric.setup_optimizers(optimizer)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iters // batch_size)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.max_iters // config.batch_size)
 
     # strict=False because missing keys due to LoRA weights not contained in state dict
     load_checkpoint(fabric, model, checkpoint_path, strict=False)
@@ -173,7 +217,8 @@ def train(
 ) -> None:
     tokenizer = Tokenizer(checkpoint_dir)
     longest_seq_length, longest_seq_ix = get_longest_seq_length(train_data)
-    model.max_seq_length = longest_seq_length
+    longest_val_seq_length, longest_seq_ix = get_longest_seq_length(val_data)
+    model.max_seq_length = max(longest_seq_length, longest_val_seq_length)
     fabric.print(
         f"The longest sequence length in the train data is {longest_seq_length}, the model's maximum sequence length is"
         f" {model.max_seq_length} and context length is {model.config.block_size}"
@@ -187,11 +232,11 @@ def train(
         # "estimated" is not as precise as "measured". Estimated is optimistic but widely used in the wild.
         # When comparing MFU or FLOP numbers with other projects that use estimated FLOPs,
         # consider passing `SpeedMonitor(flops_per_batch=estimated_flops)` instead
-        estimated_flops = estimate_flops(meta_model) * micro_batch_size
+        estimated_flops = estimate_flops(meta_model) * config.micro_batch_size
         fabric.print(f"Estimated TFLOPs: {estimated_flops * fabric.world_size / 1e12:.2f}")
         # this assumes that all samples have a fixed length equal to the longest sequence length
         # which is most likely false during finetuning
-        x = torch.randint(0, 1, (micro_batch_size, longest_seq_length))
+        x = torch.randint(0, 1, (config.micro_batch_size, longest_seq_length))
         measured_flops = measure_flops(meta_model, x)
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
         del meta_model, x
@@ -199,11 +244,14 @@ def train(
     step_count = 0
     total_lengths = 0
     total_t0 = time.perf_counter()
+    
+    
+    fabric.print(f"epochs: {config.epochs}, max_iters: {config.max_iters}, warmup_steps: {config.warmup_steps}")
 
-    for iter_num in range(max_iters):
-        if step_count <= warmup_steps:
+    for iter_num in tqdm(range(config.max_iters)):
+        if step_count <= config.warmup_steps:
             # linear warmup
-            lr = learning_rate * step_count / warmup_steps
+            lr = config.learning_rate * step_count / config.warmup_steps
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
@@ -222,34 +270,34 @@ def train(
         if not is_accumulating:
             optimizer.step()
             optimizer.zero_grad()
-            if step_count > warmup_steps:
+            if step_count > config.warmup_steps:
                 scheduler.step()
             step_count += 1
 
         t1 = time.perf_counter()
         total_lengths += input_ids.size(1)
         speed_monitor.on_train_batch_end(
-            (iter_num + 1) * micro_batch_size,
+            (iter_num + 1) * config.micro_batch_size,
             t1 - total_t0,
             # this assumes that device FLOPs are the same and that all devices have the same batch size
             fabric.world_size,
             flops_per_batch=measured_flops,
             lengths=total_lengths,
         )
-        if iter_num % log_interval == 0:
+        if iter_num % config.log_interval == 0:
             fabric.print(
                 f"iter {iter_num} step {step_count}: loss {loss.item():.4f}, iter time:"
                 f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
             )
 
-        if not is_accumulating and step_count % eval_interval == 0:
+        if not is_accumulating and step_count % config.eval_interval == 0:
             t0 = time.perf_counter()
             val_loss = validate(fabric, model, val_data, tokenizer)
             t1 = time.perf_counter() - t0
             speed_monitor.eval_end(t1)
             fabric.print(f"step {iter_num}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f}ms")
             fabric.barrier()
-        if not is_accumulating and step_count % save_interval == 0:
+        if not is_accumulating and step_count % config.save_interval == 0:
             checkpoint_path = out_dir / f"iter-{iter_num:06d}-ckpt.pth"
             save_lora_checkpoint(fabric, model, checkpoint_path)
 
@@ -258,8 +306,8 @@ def train(
 def validate(fabric: L.Fabric, model: GPT, val_data: List[Dict], tokenizer: Tokenizer) -> torch.Tensor:
     fabric.print("Validating ...")
     model.eval()
-    losses = torch.zeros(eval_iters)
-    for k in range(eval_iters):
+    losses = torch.zeros(config.eval_iters)
+    for k in range(config.eval_iters):
         input_ids, targets = get_batch(fabric, val_data)
         logits = model(input_ids)
         losses[k] = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:], chunk_size=0)
@@ -274,7 +322,7 @@ def validate(fabric: L.Fabric, model: GPT, val_data: List[Dict], tokenizer: Toke
     with fabric.init_tensor():
         # do not set `max_seq_length=max_returned_token` because memory is not a concern here
         model.set_kv_cache(batch_size=1)
-    output = generate(model, encoded, max_returned_tokens=len(encoded) + eval_max_new_tokens, temperature=0.8)
+    output = generate(model, encoded, max_returned_tokens=len(encoded) + config.eval_max_new_tokens, temperature=0.8)
     model.clear_kv_cache()
     output = tokenizer.decode(output)
     fabric.print(output)
@@ -286,7 +334,7 @@ def validate(fabric: L.Fabric, model: GPT, val_data: List[Dict], tokenizer: Toke
 def get_batch(
     fabric: L.Fabric, data: List[Dict], longest_seq_ix: Optional[int] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    ix = torch.randint(len(data), (micro_batch_size,))
+    ix = torch.randint(len(data), (config.micro_batch_size,))
     if longest_seq_ix is not None:
         # force the longest sample at the beginning so potential OOMs happen right away
         ix[0] = longest_seq_ix
